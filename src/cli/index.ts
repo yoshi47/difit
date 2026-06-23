@@ -21,7 +21,7 @@ import {
   readStdin,
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
-import { getPrPatch, getPrCommentImports } from './github.js';
+import { getPrHeadSha, getPrPatch, getPrCommentImports } from './github.js';
 
 type SpecialArg = 'working' | 'staged' | '.';
 
@@ -215,6 +215,7 @@ program
       let stdinReviewLabel = 'diff from stdin';
       let manualCommentImports: CommentImport[] = [];
       let commentImports: CommentImport[] = [];
+      let prContext: { prUrl: string; headSha: string } | undefined;
 
       if (
         options.context !== undefined &&
@@ -271,6 +272,14 @@ program
         }
 
         try {
+          prContext = { prUrl: options.pr, headSha: getPrHeadSha(options.pr) };
+        } catch (error) {
+          console.warn(
+            `Warning: Failed to resolve PR head SHA; "Post to GitHub" will be disabled: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          );
+        }
+
+        try {
           const prCommentImports = await getPrCommentImports(options.pr);
           commentImports = [...prCommentImports, ...manualCommentImports];
         } catch (error) {
@@ -314,6 +323,7 @@ program
           clearComments: options.clean,
           keepAlive: options.keepAlive,
           ...(commentImports.length > 0 ? { commentImports } : {}),
+          ...(prContext ? { prContext } : {}),
         });
 
         if (backgroundMode) {

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { type Server } from 'http';
 import { join, dirname, isAbsolute, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,7 @@ import { getFileExtension } from '../utils/fileUtils.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
+import { registerGitHubReviewRoute } from './githubReviewRoute.js';
 
 import {
   type BaseMode,
@@ -58,6 +59,8 @@ interface ServerOptions {
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
+  // Present only in --pr mode: enables POST /api/github-review (pending review).
+  prContext?: { prUrl: string; headSha: string };
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -127,6 +130,11 @@ export async function startServer(
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
+  // Pending-review write path (only active in --pr mode).
+  const reviewPostToken = options.prContext ? randomBytes(32).toString('hex') : undefined;
+  const isLoopbackBind =
+    !options.host || options.host === 'localhost' || options.host === '127.0.0.1';
+  let boundPort = options.preferredPort ?? 4966;
   const initialSelection = options.selection ?? createDiffSelection('', '');
   const commentImportId =
     initialCommentImports.length > 0
@@ -199,11 +207,12 @@ export async function startServer(
     Boolean(options.stdinDiff),
   );
 
-  function parseRepositoryRelativePath(
-    filepath: unknown,
-  ):
+  function parseRepositoryRelativePath(filepath: unknown):
     | { ok: true; path: string }
-    | { ok: false; error: 'Invalid file path' | 'File path outside repository' } {
+    | {
+        ok: false;
+        error: 'Invalid file path' | 'File path outside repository';
+      } {
     if (typeof filepath !== 'string' || filepath.length === 0) {
       return { ok: false, error: 'Invalid file path' };
     }
@@ -288,6 +297,18 @@ export async function startServer(
     return nextSession;
   }
 
+  if (options.prContext && reviewPostToken) {
+    registerGitHubReviewRoute(app, {
+      prContext: options.prContext,
+      reviewPostToken,
+      isLoopbackBind,
+      getPort: () => boundPort,
+      resolveSelection: (query) => getCommentSelectionFromQuery(query),
+      getThreads: (selection) => getOrCreateCommentSession(selection).threads,
+      getDiffFiles: () => initialDiffData.files,
+    });
+  }
+
   app.get('/api/diff', async (req, res) => {
     const ignoreWhitespace = req.query.ignoreWhitespace === 'true';
     const hasBase = typeof req.query.base === 'string';
@@ -355,6 +376,8 @@ export async function startServer(
       repositoryId,
       commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
       commentImportId: shouldIncludeCommentImports ? commentImportId : undefined,
+      prUrl: options.prContext?.prUrl,
+      reviewPostToken,
     });
   });
 
@@ -993,6 +1016,7 @@ export async function startServer(
     options.preferredPort || 4966,
     options.host || 'localhost',
   );
+  boundPort = port;
 
   // Security warning for non-localhost binding
   if (options.host && options.host !== '127.0.0.1' && options.host !== 'localhost') {
