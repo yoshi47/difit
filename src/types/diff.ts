@@ -61,6 +61,33 @@ export interface DiffResponse {
   repositoryId?: string;
   commentImports?: CommentImport[];
   commentImportId?: string;
+  // Present only in --pr mode: enables the "Post to GitHub" pending-review flow.
+  prUrl?: string;
+  // One-time token required by POST /api/github-review (CSRF/DSRF guard).
+  reviewPostToken?: string;
+}
+
+// A review comment that could not be posted to GitHub, surfaced to the user
+// instead of being silently dropped.
+export interface SkippedReviewComment {
+  threadId: string;
+  path: string;
+  side: 'LEFT' | 'RIGHT';
+  line: number;
+  reason: string;
+}
+
+// Result of POST /api/github-review.
+export interface GitHubReviewResult {
+  success: boolean;
+  posted: number;
+  skipped: SkippedReviewComment[];
+  htmlUrl?: string;
+  reviewId?: number;
+  // True when the user already has a pending review on this PR (HTTP 422).
+  pendingConflict?: boolean;
+  pendingReviewUrl?: string;
+  error?: string;
 }
 
 export interface GeneratedStatusResponse {
