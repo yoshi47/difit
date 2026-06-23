@@ -60,7 +60,9 @@ interface ServerOptions {
   repoPath?: string;
   contextLines?: number;
   // Present only in --pr mode: enables POST /api/github-review (pending review).
-  prContext?: { prUrl: string; headSha: string };
+  prContext?: { prUrl: string; headSha: string; prTitle?: string };
+  // Optional markdown shown as a "PR Overview" banner in the client.
+  prOverview?: string;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -377,7 +379,9 @@ export async function startServer(
       commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
       commentImportId: shouldIncludeCommentImports ? commentImportId : undefined,
       prUrl: options.prContext?.prUrl,
+      prTitle: options.prContext?.prTitle,
       reviewPostToken,
+      prOverview: options.prOverview,
     });
   });
 

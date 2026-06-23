@@ -63,8 +63,14 @@ export interface DiffResponse {
   commentImportId?: string;
   // Present only in --pr mode: enables the "Post to GitHub" pending-review flow.
   prUrl?: string;
+  // Present only in --pr mode: the PR's human title (from `gh pr view`), shown in
+  // the header and browser tab so multiple difit tabs are distinguishable.
+  prTitle?: string;
   // One-time token required by POST /api/github-review (CSRF/DSRF guard).
   reviewPostToken?: string;
+  // Optional markdown (from --overview) shown as a "PR Overview" banner so the
+  // reviewer sees the PR's intent before reading the diff.
+  prOverview?: string;
 }
 
 // A review comment that could not be posted to GitHub, surfaced to the user

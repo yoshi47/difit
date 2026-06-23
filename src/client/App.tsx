@@ -31,6 +31,7 @@ import { FileList } from './components/FileList';
 import { GitHubIcon } from './components/GitHubIcon';
 import { HelpModal } from './components/HelpModal';
 import { Logo } from './components/Logo';
+import { PrOverviewBanner } from './components/PrOverviewBanner';
 import { ReloadButton } from './components/ReloadButton';
 import { RevisionDetailModal } from './components/RevisionDetailModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -312,6 +313,38 @@ function App() {
     settings.autoViewedPatterns,
     resolvedSelection?.baseMode,
   );
+
+  // PR identity (--pr mode only): parse owner/repo/#number from the URL so the
+  // header and browser tab can show which PR this difit instance is reviewing.
+  const prMeta = useMemo(() => {
+    const url = diffData?.prUrl;
+    if (!url) return null;
+    const match = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(url);
+    if (!match)
+      return {
+        url,
+        repo: undefined,
+        number: undefined,
+        title: diffData?.prTitle,
+      };
+    return {
+      url,
+      repo: `${match[1]}/${match[2]}`,
+      number: Number(match[3]),
+      title: diffData?.prTitle,
+    };
+  }, [diffData?.prUrl, diffData?.prTitle]);
+
+  // Keep the browser tab title in sync with the PR so multiple difit tabs are
+  // distinguishable at a glance.
+  useEffect(() => {
+    if (!prMeta) {
+      document.title = 'difit - Git Diff Viewer';
+      return;
+    }
+    const label = prMeta.number ? `#${prMeta.number}` : (prMeta.repo ?? 'PR');
+    document.title = prMeta.title ? `${label} ${prMeta.title} · difit` : `${label} · difit`;
+  }, [prMeta]);
 
   // Reset initialization flag when diff context changes
   useEffect(() => {
@@ -1178,13 +1211,41 @@ function App() {
               maxWidth: isMobile ? 'none' : isFileTreeOpen ? '600px' : 'none',
             }}
           >
-            <h1>
+            <h1 className="flex items-center gap-2 min-w-0">
               <Logo
                 style={{
                   height: '18px',
                   color: 'var(--color-github-text-secondary)',
                 }}
               />
+              {prMeta && (
+                <span className="group relative flex min-w-0">
+                  <a
+                    href={prMeta.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`${prMeta.repo ?? ''}${prMeta.number ? ` #${prMeta.number}` : ''}${
+                      prMeta.title ? ` — ${prMeta.title}` : ''
+                    }`}
+                    className="min-w-0 truncate text-sm text-github-text-secondary hover:text-github-accent hover:underline"
+                  >
+                    {prMeta.number && (
+                      <span className="font-semibold text-github-text-primary">
+                        #{prMeta.number}
+                      </span>
+                    )}
+                    {prMeta.title && <span className="ml-1.5">{prMeta.title}</span>}
+                  </a>
+                  {prMeta.title && (
+                    // Full title on hover: overlay that shows the un-truncated title
+                    // (wrapping) so a long title is fully readable without resizing.
+                    <span className="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-max max-w-md whitespace-normal break-words rounded border border-github-border bg-github-bg-secondary px-3 py-2 text-sm text-github-text-primary shadow-lg group-hover:block">
+                      {prMeta.number && <span className="font-semibold">#{prMeta.number} </span>}
+                      {prMeta.title}
+                    </span>
+                  )}
+                </span>
+              )}
             </h1>
             <div className="flex items-center gap-1">
               <button
@@ -1359,6 +1420,8 @@ function App() {
             onClick={() => setIsFileTreeOpen(false)}
           />
         )}
+
+        {diffData?.prOverview && <PrOverviewBanner markdown={diffData.prOverview} />}
 
         <div className="flex flex-1 overflow-hidden relative">
           <div

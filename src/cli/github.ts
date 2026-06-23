@@ -512,6 +512,20 @@ export function getPrHeadSha(prArg: string): string {
   }
 }
 
+// Best-effort PR title for display only (header + browser tab). Never throws:
+// a missing title must not break the review, so callers get '' on failure.
+export function getPrTitle(prArg: string): string {
+  try {
+    resolveWriteTarget(prArg);
+    return execFileSync('gh', ['pr', 'view', prArg, '--json', 'title', '-q', '.title'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
 function getCurrentUserLogin(hostname: string): string {
   try {
     return execFileSync('gh', ['api', ...hostArgs(hostname), 'user', '-q', '.login'], {
