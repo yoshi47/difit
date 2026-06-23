@@ -9,9 +9,11 @@ import {
   type DiffSide,
   type LineNumber,
   type CommentThread,
+  type GitHubReviewResult,
   type RevisionsResponse,
 } from '../types/diff';
 import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
+import { getThreadSeverity } from '../utils/threadSeverity';
 import { mergeCommentThreads } from '../utils/commentImports';
 import {
   createDiffSelection,
@@ -490,6 +492,103 @@ function App() {
     () => hasMultipleCommentAuthors(normalizedThreads.flatMap((thread) => thread.messages)),
     [normalizedThreads],
   );
+
+  // --- Post-to-GitHub (pending review) selection -------------------------
+  const canPostReview = Boolean(diffData?.prUrl && diffData?.reviewPostToken);
+  const knownThreadIdsRef = useRef<Set<string>>(new Set());
+  const [selectedThreadIds, setSelectedThreadIds] = useState<Set<string>>(new Set());
+  const [reviewPostState, setReviewPostState] = useState<{
+    status: 'idle' | 'posting' | 'done' | 'error';
+    result?: GitHubReviewResult;
+  }>({ status: 'idle' });
+
+  // Default selection: AI-authored comments ON, imported/manual OFF. The user's
+  // explicit toggles are preserved; only newly-seen threads get the default.
+  useEffect(() => {
+    setSelectedThreadIds((prev) => {
+      const next = new Set<string>();
+      for (const thread of normalizedThreads) {
+        if (!knownThreadIdsRef.current.has(thread.id)) {
+          knownThreadIdsRef.current.add(thread.id);
+          if (thread.messages[0]?.author === 'AI Reviewer') {
+            next.add(thread.id);
+          }
+        } else if (prev.has(thread.id)) {
+          next.add(thread.id);
+        }
+      }
+      return next;
+    });
+  }, [normalizedThreads]);
+
+  const toggleThreadSelected = useCallback((threadId: string) => {
+    setSelectedThreadIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(threadId)) {
+        next.delete(threadId);
+      } else {
+        next.add(threadId);
+      }
+      return next;
+    });
+  }, []);
+
+  const selectAllThreads = useCallback(() => {
+    setSelectedThreadIds(new Set(normalizedThreads.map((thread) => thread.id)));
+  }, [normalizedThreads]);
+
+  const selectNoThreads = useCallback(() => {
+    setSelectedThreadIds(new Set());
+  }, []);
+
+  const selectHighSeverityThreads = useCallback(() => {
+    setSelectedThreadIds(
+      new Set(
+        normalizedThreads
+          .filter((thread) => {
+            const severity = getThreadSeverity(thread.messages[0]?.body);
+            return severity === 'critical' || severity === 'important';
+          })
+          .map((thread) => thread.id),
+      ),
+    );
+  }, [normalizedThreads]);
+
+  const handlePostToGitHub = useCallback(async () => {
+    if (!diffData?.reviewPostToken) {
+      return;
+    }
+    const threadIds = [...selectedThreadIds];
+    if (threadIds.length === 0) {
+      return;
+    }
+    if (!confirm(`Post ${threadIds.length} comment(s) to GitHub as a pending (draft) review?`)) {
+      return;
+    }
+    setReviewPostState({ status: 'posting' });
+    try {
+      const response = await fetch(getCommentApiUrl('/api/github-review'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Difit-Token': diffData.reviewPostToken,
+        },
+        body: JSON.stringify({ threadIds }),
+      });
+      const result = (await response.json()) as GitHubReviewResult;
+      setReviewPostState({ status: response.ok ? 'done' : 'error', result });
+    } catch (error) {
+      setReviewPostState({
+        status: 'error',
+        result: {
+          success: false,
+          posted: 0,
+          skipped: [],
+          error: error instanceof Error ? error.message : 'Network error',
+        },
+      });
+    }
+  }, [diffData?.reviewPostToken, getCommentApiUrl, selectedThreadIds]);
   const threadsByFile = useMemo(() => {
     const map = new Map<string, CommentThread[]>();
     normalizedThreads.forEach((thread) => {
@@ -1080,7 +1179,12 @@ function App() {
             }}
           >
             <h1>
-              <Logo style={{ height: '18px', color: 'var(--color-github-text-secondary)' }} />
+              <Logo
+                style={{
+                  height: '18px',
+                  color: 'var(--color-github-text-secondary)',
+                }}
+              />
             </h1>
             <div className="flex items-center gap-1">
               <button
@@ -1448,6 +1552,14 @@ function App() {
           onRemoveMessage={removeMessage}
           onUpdateMessage={updateMessage}
           syntaxTheme={settings.syntaxTheme}
+          selectable={canPostReview}
+          selectedIds={selectedThreadIds}
+          onToggleSelected={toggleThreadSelected}
+          onSelectAll={selectAllThreads}
+          onSelectNone={selectNoThreads}
+          onSelectHighSeverity={selectHighSeverityThreads}
+          onPostToGitHub={handlePostToGitHub}
+          postState={reviewPostState}
         />
       </div>
     </WordHighlightProvider>

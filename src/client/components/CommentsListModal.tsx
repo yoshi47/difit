@@ -2,10 +2,15 @@ import { X } from 'lucide-react';
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { useHotkeys, useHotkeysContext } from 'react-hotkeys-hook';
 
-import type { CommentThread } from '../../types/diff';
+import type { CommentThread, GitHubReviewResult } from '../../types/diff';
 
 import { CommentThreadCard } from './CommentThreadCard';
 import type { AppearanceSettings } from './SettingsModal';
+
+interface GitHubReviewPostState {
+  status: 'idle' | 'posting' | 'done' | 'error';
+  result?: GitHubReviewResult;
+}
 
 interface CommentsListModalProps {
   isOpen: boolean;
@@ -19,6 +24,15 @@ interface CommentsListModalProps {
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
+  // Post-to-GitHub (pending review) selection — only set in --pr mode.
+  selectable?: boolean;
+  selectedIds?: Set<string>;
+  onToggleSelected?: (threadId: string) => void;
+  onSelectAll?: () => void;
+  onSelectNone?: () => void;
+  onSelectHighSeverity?: () => void;
+  onPostToGitHub?: () => void;
+  postState?: GitHubReviewPostState;
 }
 
 export function CommentsListModal({
@@ -33,6 +47,14 @@ export function CommentsListModal({
   onRemoveMessage,
   onUpdateMessage,
   syntaxTheme,
+  selectable = false,
+  selectedIds,
+  onToggleSelected,
+  onSelectAll,
+  onSelectNone,
+  onSelectHighSeverity,
+  onPostToGitHub,
+  postState,
 }: CommentsListModalProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const commentRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -152,6 +174,80 @@ export function CommentsListModal({
             <span className="font-mono">d</span> to resolve • <span className="font-mono">Esc</span>{' '}
             to close
           </div>
+          {selectable && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-github-border pt-3">
+              <span className="text-xs text-github-text-secondary">
+                {selectedIds?.size ?? 0} selected
+              </span>
+              <button
+                type="button"
+                onClick={onSelectAll}
+                className="rounded border border-github-border bg-github-bg-tertiary px-2 py-0.5 text-xs text-github-text-primary hover:bg-github-bg-primary"
+              >
+                All
+              </button>
+              <button
+                type="button"
+                onClick={onSelectNone}
+                className="rounded border border-github-border bg-github-bg-tertiary px-2 py-0.5 text-xs text-github-text-primary hover:bg-github-bg-primary"
+              >
+                None
+              </button>
+              <button
+                type="button"
+                onClick={onSelectHighSeverity}
+                className="rounded border border-github-border bg-github-bg-tertiary px-2 py-0.5 text-xs text-github-text-primary hover:bg-github-bg-primary"
+              >
+                Critical + Important
+              </button>
+              <button
+                type="button"
+                onClick={onPostToGitHub}
+                disabled={(selectedIds?.size ?? 0) === 0 || postState?.status === 'posting'}
+                className="ml-auto rounded bg-green-600 px-3 py-1 text-xs font-medium text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {postState?.status === 'posting' ? 'Posting…' : 'Post to GitHub'}
+              </button>
+              {postState?.result && postState.status !== 'posting' && (
+                <div className="w-full text-xs">
+                  {postState.result.success ? (
+                    <span className="text-green-700">
+                      ✓ Posted {postState.result.posted} comment(s) as a pending review.{' '}
+                      {postState.result.htmlUrl && (
+                        <a
+                          href={postState.result.htmlUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="underline"
+                        >
+                          Open on GitHub
+                        </a>
+                      )}
+                      {postState.result.skipped.length > 0 &&
+                        ` (${postState.result.skipped.length} skipped, out of diff range)`}
+                    </span>
+                  ) : (
+                    <span className="text-github-danger">
+                      {postState.result.error ?? 'Failed to post review.'}
+                      {postState.result.pendingReviewUrl && (
+                        <>
+                          {' '}
+                          <a
+                            href={postState.result.pendingReviewUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="underline"
+                          >
+                            Open pending review
+                          </a>
+                        </>
+                      )}
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="max-h-[calc(80vh-120px)] overflow-y-auto">
@@ -169,26 +265,40 @@ export function CommentsListModal({
                       }}
                       className={selectedIndex === index ? 'rounded ring-2 ring-blue-500' : ''}
                     >
-                      <CommentThreadCard
-                        thread={thread}
-                        showAuthorBadges={showAuthorBadges}
-                        confirmRootAction={false}
-                        onGeneratePrompt={onGenerateThreadPrompt}
-                        onRemoveThread={(threadId) => {
-                          if (threadId === thread.id) {
-                            handleDeleteThread(thread);
-                          }
-                        }}
-                        onReplyToThread={onReplyToThread}
-                        onRemoveMessage={onRemoveMessage}
-                        onUpdateMessage={onUpdateMessage}
-                        syntaxTheme={syntaxTheme}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedIndex(index);
-                          handleThreadClick(thread);
-                        }}
-                      />
+                      <div className={selectable ? 'flex items-start gap-2' : ''}>
+                        {selectable && (
+                          <input
+                            type="checkbox"
+                            className="mt-3 ml-1 shrink-0"
+                            checked={selectedIds?.has(thread.id) ?? false}
+                            onChange={() => onToggleSelected?.(thread.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label="Include this comment in the GitHub review"
+                          />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <CommentThreadCard
+                            thread={thread}
+                            showAuthorBadges={showAuthorBadges}
+                            confirmRootAction={false}
+                            onGeneratePrompt={onGenerateThreadPrompt}
+                            onRemoveThread={(threadId) => {
+                              if (threadId === thread.id) {
+                                handleDeleteThread(thread);
+                              }
+                            }}
+                            onReplyToThread={onReplyToThread}
+                            onRemoveMessage={onRemoveMessage}
+                            onUpdateMessage={onUpdateMessage}
+                            syntaxTheme={syntaxTheme}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedIndex(index);
+                              handleThreadClick(thread);
+                            }}
+                          />
+                        </div>
+                      </div>
                     </div>
                   ))}
                 </div>
