@@ -130,7 +130,18 @@ export async function startServer(
 ): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
   const app = express();
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
-  const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
+  // In --pr mode there is no reliable local commit-ish (the diff is fetched
+  // from GitHub via stdin, see the `stdinDiff` branch below), so comment/viewed
+  // storage can't be scoped by baseCommitish/targetCommitish the way git-mode
+  // diffs are. Scope by the PR identity + head SHA instead of the repo path,
+  // otherwise every PR ever reviewed from this checkout collapses onto the same
+  // storage bucket (repositoryId, unlike baseCommitish/targetCommitish, has no
+  // client-side meaning beyond storage isolation, so this is safe to repurpose).
+  const repositoryId = options.prContext
+    ? createHash('sha256')
+        .update(`pr:${options.prContext.prUrl}@${options.prContext.headSha}`)
+        .digest('hex')
+    : createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
   // Pending-review write path (only active in --pr mode).
   const reviewPostToken = options.prContext ? randomBytes(32).toString('hex') : undefined;
@@ -161,10 +172,17 @@ export async function startServer(
   app.use(express.json());
   app.use(express.text()); // For sendBeacon text/plain requests
 
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', 'http://localhost:*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    // A given port can be reused by a different diff/PR across server restarts
+    // (--pr mode always binds the same default port). Without this, a plain
+    // reload can serve a browser-cached /api/* response from a previous,
+    // unrelated session on this origin instead of hitting the new process.
+    if (req.path.startsWith('/api/')) {
+      res.header('Cache-Control', 'no-store');
+    }
     next();
   });
 
