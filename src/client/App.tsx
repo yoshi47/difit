@@ -9,9 +9,11 @@ import {
   type DiffSide,
   type LineNumber,
   type CommentThread,
+  type GitHubReviewResult,
   type RevisionsResponse,
 } from '../types/diff';
 import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
+import { getThreadSeverity } from '../utils/threadSeverity';
 import { mergeCommentThreads } from '../utils/commentImports';
 import {
   createDiffSelection,
@@ -29,6 +31,7 @@ import { FileList } from './components/FileList';
 import { GitHubIcon } from './components/GitHubIcon';
 import { HelpModal } from './components/HelpModal';
 import { Logo } from './components/Logo';
+import { PrOverviewBanner } from './components/PrOverviewBanner';
 import { ReloadButton } from './components/ReloadButton';
 import { RevisionDetailModal } from './components/RevisionDetailModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -311,6 +314,38 @@ function App() {
     resolvedSelection?.baseMode,
   );
 
+  // PR identity (--pr mode only): parse owner/repo/#number from the URL so the
+  // header and browser tab can show which PR this difit instance is reviewing.
+  const prMeta = useMemo(() => {
+    const url = diffData?.prUrl;
+    if (!url) return null;
+    const match = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(url);
+    if (!match)
+      return {
+        url,
+        repo: undefined,
+        number: undefined,
+        title: diffData?.prTitle,
+      };
+    return {
+      url,
+      repo: `${match[1]}/${match[2]}`,
+      number: Number(match[3]),
+      title: diffData?.prTitle,
+    };
+  }, [diffData?.prUrl, diffData?.prTitle]);
+
+  // Keep the browser tab title in sync with the PR so multiple difit tabs are
+  // distinguishable at a glance.
+  useEffect(() => {
+    if (!prMeta) {
+      document.title = 'difit - Git Diff Viewer';
+      return;
+    }
+    const label = prMeta.number ? `#${prMeta.number}` : (prMeta.repo ?? 'PR');
+    document.title = prMeta.title ? `${label} ${prMeta.title} · difit` : `${label} · difit`;
+  }, [prMeta]);
+
   // Reset initialization flag when diff context changes
   useEffect(() => {
     collapsedInitializedRef.current = false;
@@ -490,6 +525,103 @@ function App() {
     () => hasMultipleCommentAuthors(normalizedThreads.flatMap((thread) => thread.messages)),
     [normalizedThreads],
   );
+
+  // --- Post-to-GitHub (pending review) selection -------------------------
+  const canPostReview = Boolean(diffData?.prUrl && diffData?.reviewPostToken);
+  const knownThreadIdsRef = useRef<Set<string>>(new Set());
+  const [selectedThreadIds, setSelectedThreadIds] = useState<Set<string>>(new Set());
+  const [reviewPostState, setReviewPostState] = useState<{
+    status: 'idle' | 'posting' | 'done' | 'error';
+    result?: GitHubReviewResult;
+  }>({ status: 'idle' });
+
+  // Default selection: AI-authored comments ON, imported/manual OFF. The user's
+  // explicit toggles are preserved; only newly-seen threads get the default.
+  useEffect(() => {
+    setSelectedThreadIds((prev) => {
+      const next = new Set<string>();
+      for (const thread of normalizedThreads) {
+        if (!knownThreadIdsRef.current.has(thread.id)) {
+          knownThreadIdsRef.current.add(thread.id);
+          if (thread.messages[0]?.author === 'AI Reviewer') {
+            next.add(thread.id);
+          }
+        } else if (prev.has(thread.id)) {
+          next.add(thread.id);
+        }
+      }
+      return next;
+    });
+  }, [normalizedThreads]);
+
+  const toggleThreadSelected = useCallback((threadId: string) => {
+    setSelectedThreadIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(threadId)) {
+        next.delete(threadId);
+      } else {
+        next.add(threadId);
+      }
+      return next;
+    });
+  }, []);
+
+  const selectAllThreads = useCallback(() => {
+    setSelectedThreadIds(new Set(normalizedThreads.map((thread) => thread.id)));
+  }, [normalizedThreads]);
+
+  const selectNoThreads = useCallback(() => {
+    setSelectedThreadIds(new Set());
+  }, []);
+
+  const selectHighSeverityThreads = useCallback(() => {
+    setSelectedThreadIds(
+      new Set(
+        normalizedThreads
+          .filter((thread) => {
+            const severity = getThreadSeverity(thread.messages[0]?.body);
+            return severity === 'critical' || severity === 'important';
+          })
+          .map((thread) => thread.id),
+      ),
+    );
+  }, [normalizedThreads]);
+
+  const handlePostToGitHub = useCallback(async () => {
+    if (!diffData?.reviewPostToken) {
+      return;
+    }
+    const threadIds = [...selectedThreadIds];
+    if (threadIds.length === 0) {
+      return;
+    }
+    if (!confirm(`Post ${threadIds.length} comment(s) to GitHub as a pending (draft) review?`)) {
+      return;
+    }
+    setReviewPostState({ status: 'posting' });
+    try {
+      const response = await fetch(getCommentApiUrl('/api/github-review'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Difit-Token': diffData.reviewPostToken,
+        },
+        body: JSON.stringify({ threadIds }),
+      });
+      const result = (await response.json()) as GitHubReviewResult;
+      setReviewPostState({ status: response.ok ? 'done' : 'error', result });
+    } catch (error) {
+      setReviewPostState({
+        status: 'error',
+        result: {
+          success: false,
+          posted: 0,
+          skipped: [],
+          error: error instanceof Error ? error.message : 'Network error',
+        },
+      });
+    }
+  }, [diffData?.reviewPostToken, getCommentApiUrl, selectedThreadIds]);
   const threadsByFile = useMemo(() => {
     const map = new Map<string, CommentThread[]>();
     normalizedThreads.forEach((thread) => {
@@ -1079,8 +1211,41 @@ function App() {
               maxWidth: isMobile ? 'none' : isFileTreeOpen ? '600px' : 'none',
             }}
           >
-            <h1>
-              <Logo style={{ height: '18px', color: 'var(--color-github-text-secondary)' }} />
+            <h1 className="flex items-center gap-2 min-w-0">
+              <Logo
+                style={{
+                  height: '18px',
+                  color: 'var(--color-github-text-secondary)',
+                }}
+              />
+              {prMeta && (
+                <span className="group relative flex min-w-0">
+                  <a
+                    href={prMeta.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`${prMeta.repo ?? ''}${prMeta.number ? ` #${prMeta.number}` : ''}${
+                      prMeta.title ? ` — ${prMeta.title}` : ''
+                    }`}
+                    className="min-w-0 truncate text-sm text-github-text-secondary hover:text-github-accent hover:underline"
+                  >
+                    {prMeta.number && (
+                      <span className="font-semibold text-github-text-primary">
+                        #{prMeta.number}
+                      </span>
+                    )}
+                    {prMeta.title && <span className="ml-1.5">{prMeta.title}</span>}
+                  </a>
+                  {prMeta.title && (
+                    // Full title on hover: overlay that shows the un-truncated title
+                    // (wrapping) so a long title is fully readable without resizing.
+                    <span className="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-max max-w-md whitespace-normal break-words rounded border border-github-border bg-github-bg-secondary px-3 py-2 text-sm text-github-text-primary shadow-lg group-hover:block">
+                      {prMeta.number && <span className="font-semibold">#{prMeta.number} </span>}
+                      {prMeta.title}
+                    </span>
+                  )}
+                </span>
+              )}
             </h1>
             <div className="flex items-center gap-1">
               <button
@@ -1255,6 +1420,8 @@ function App() {
             onClick={() => setIsFileTreeOpen(false)}
           />
         )}
+
+        {diffData?.prOverview && <PrOverviewBanner markdown={diffData.prOverview} />}
 
         <div className="flex flex-1 overflow-hidden relative">
           <div
@@ -1448,6 +1615,14 @@ function App() {
           onRemoveMessage={removeMessage}
           onUpdateMessage={updateMessage}
           syntaxTheme={settings.syntaxTheme}
+          selectable={canPostReview}
+          selectedIds={selectedThreadIds}
+          onToggleSelected={toggleThreadSelected}
+          onSelectAll={selectAllThreads}
+          onSelectNone={selectNoThreads}
+          onSelectHighSeverity={selectHighSeverityThreads}
+          onPostToGitHub={handlePostToGitHub}
+          postState={reviewPostState}
         />
       </div>
     </WordHighlightProvider>

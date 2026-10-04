@@ -1,6 +1,7 @@
 import { execFileSync } from 'child_process';
 
 import type { CommentImport, DiffCommentPosition, DiffLineRange } from '../types/diff.js';
+import type { ReviewCommentPayload } from '../utils/reviewMapping.js';
 
 interface PullRequestInfo {
   owner: string;
@@ -432,5 +433,208 @@ export function getPrCommentImports(prArg: string): Promise<CommentImport[]> {
 
       throw formatGhCommandError(error);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Write path: post curated comments to GitHub as a PENDING (draft) review.
+// The inverse of the read path above. We never submit the review automatically
+// (event is omitted), so the user finishes/submits it from GitHub's own UI.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ALLOWED_GH_HOSTS = ['github.com'];
+
+function allowedGitHubHosts(): string[] {
+  const extra = (process.env.DIFIT_ALLOWED_GH_HOSTS ?? '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
+  return [...DEFAULT_ALLOWED_GH_HOSTS, ...extra];
+}
+
+// parseGitHubPrUrl does not validate the hostname, so the write path must
+// refuse to push to anything but github.com (or an explicitly allowed GHE host).
+function resolveWriteTarget(prArg: string): PullRequestInfo {
+  const info = parseGitHubPrUrl(prArg);
+  if (!info) {
+    throw new Error('Invalid GitHub PR URL');
+  }
+  if (!allowedGitHubHosts().includes(info.hostname)) {
+    throw new Error(
+      `Refusing to write to untrusted host "${info.hostname}". ` +
+        `Allowed: ${allowedGitHubHosts().join(', ')} (set DIFIT_ALLOWED_GH_HOSTS to extend).`,
+    );
+  }
+  return info;
+}
+
+function hostArgs(hostname: string): string[] {
+  return hostname === 'github.com' ? [] : ['--hostname', hostname];
+}
+
+function ghStderrText(error: unknown): string {
+  const stderr = (error as { stderr?: Buffer | string }).stderr;
+  if (typeof stderr === 'string') {
+    return stderr;
+  }
+  if (Buffer.isBuffer(stderr)) {
+    return stderr.toString('utf8');
+  }
+  return error instanceof Error ? error.message : '';
+}
+
+export type GitHubReviewErrorKind = 'pending_conflict' | 'line_unresolved' | 'unknown';
+
+export class GitHubReviewError extends Error {
+  readonly kind: GitHubReviewErrorKind;
+
+  constructor(message: string, kind: GitHubReviewErrorKind) {
+    super(message);
+    this.name = 'GitHubReviewError';
+    this.kind = kind;
+  }
+}
+
+export function getPrHeadSha(prArg: string): string {
+  resolveWriteTarget(prArg);
+  try {
+    const sha = execFileSync(
+      'gh',
+      ['pr', 'view', prArg, '--json', 'headRefOid', '-q', '.headRefOid'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    ).trim();
+    if (!sha) {
+      throw new Error('gh pr view returned an empty headRefOid');
+    }
+    return sha;
+  } catch (error) {
+    throw formatGhCommandError(error);
+  }
+}
+
+// Best-effort PR title for display only (header + browser tab). Never throws:
+// a missing title must not break the review, so callers get '' on failure.
+export function getPrTitle(prArg: string): string {
+  try {
+    resolveWriteTarget(prArg);
+    return execFileSync('gh', ['pr', 'view', prArg, '--json', 'title', '-q', '.title'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function getCurrentUserLogin(hostname: string): string {
+  try {
+    return execFileSync('gh', ['api', ...hostArgs(hostname), 'user', '-q', '.login'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch (error) {
+    throw formatGhCommandError(error);
+  }
+}
+
+export interface ExistingPendingReview {
+  id: number;
+  htmlUrl: string;
+}
+
+interface GitHubReviewListItem {
+  id?: number;
+  state?: string;
+  html_url?: string;
+  user?: { login?: string } | null;
+}
+
+// GitHub allows only one pending review per user per PR (a 2nd create returns
+// HTTP 422). We check up front so we can show a clear message + deep link
+// instead of relying on parsing the 422 body.
+export function getMyPendingReview(prArg: string): ExistingPendingReview | null {
+  const { owner, repo, pullNumber, hostname } = resolveWriteTarget(prArg);
+  const login = getCurrentUserLogin(hostname);
+  try {
+    const stdout = execFileSync(
+      'gh',
+      [
+        'api',
+        ...hostArgs(hostname),
+        '--paginate',
+        `repos/${owner}/${repo}/pulls/${pullNumber}/reviews`,
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const reviews = JSON.parse(stdout) as GitHubReviewListItem[];
+    const pending = reviews.find(
+      (review) => review.state === 'PENDING' && review.user?.login === login,
+    );
+    if (pending && typeof pending.id === 'number') {
+      return { id: pending.id, htmlUrl: pending.html_url ?? '' };
+    }
+    return null;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Invalid JSON returned from gh api (reviews)');
+    }
+    throw formatGhCommandError(error);
+  }
+}
+
+export interface CreatedPendingReview {
+  reviewId: number;
+  htmlUrl: string;
+}
+
+export function createPendingReview(
+  prArg: string,
+  params: { commitId: string; comments: ReviewCommentPayload[] },
+): CreatedPendingReview {
+  const { owner, repo, pullNumber, hostname } = resolveWriteTarget(prArg);
+
+  // event omitted => PENDING (draft). Verified against the live API.
+  const payload = JSON.stringify({
+    commit_id: params.commitId,
+    comments: params.comments,
+  });
+
+  try {
+    const stdout = execFileSync(
+      'gh',
+      [
+        'api',
+        ...hostArgs(hostname),
+        '-X',
+        'POST',
+        `repos/${owner}/${repo}/pulls/${pullNumber}/reviews`,
+        '--input',
+        '-',
+      ],
+      { input: payload, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const review = JSON.parse(stdout) as { id?: number; html_url?: string };
+    if (typeof review.id !== 'number') {
+      throw new Error('GitHub did not return a review id');
+    }
+    return { reviewId: review.id, htmlUrl: review.html_url ?? '' };
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Invalid JSON returned from gh api (create review)');
+    }
+    const stderr = ghStderrText(error);
+    if (/one pending review per pull request/i.test(stderr)) {
+      throw new GitHubReviewError(
+        'You already have a pending review on this pull request.',
+        'pending_conflict',
+      );
+    }
+    if (/line could not be resolved/i.test(stderr)) {
+      throw new GitHubReviewError(
+        'A comment targets a line outside the diff and was rejected by GitHub.',
+        'line_unresolved',
+      );
+    }
+    throw formatGhCommandError(error);
   }
 }

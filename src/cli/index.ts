@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from 'child_process';
+import { readFileSync } from 'node:fs';
+
 import { Command } from 'commander';
 import { simpleGit, type SimpleGit } from 'simple-git';
 
@@ -21,7 +23,7 @@ import {
   readStdin,
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
-import { getPrPatch, getPrCommentImports } from './github.js';
+import { getPrHeadSha, getPrPatch, getPrCommentImports, getPrTitle } from './github.js';
 
 type SpecialArg = 'working' | 'staged' | '.';
 
@@ -167,6 +169,7 @@ interface CliOptions {
   background?: boolean;
   context?: number;
   mergeBase?: boolean;
+  overview?: string;
 }
 
 const BACKGROUND_CHILD_ENV = 'DIFIT_BACKGROUND_CHILD';
@@ -207,6 +210,7 @@ program
     '--merge-base',
     'resolve the base revision with git merge-base before diffing (Git revision mode only)',
   )
+  .option('--overview <file>', 'markdown file shown as a "PR Overview" banner above the diff')
   .action(async (commitish: string, compareWith: string | undefined, options: CliOptions) => {
     try {
       const isBackgroundChild = process.env[BACKGROUND_CHILD_ENV] === '1';
@@ -215,6 +219,18 @@ program
       let stdinReviewLabel = 'diff from stdin';
       let manualCommentImports: CommentImport[] = [];
       let commentImports: CommentImport[] = [];
+      let prContext: { prUrl: string; headSha: string; prTitle?: string } | undefined;
+
+      let prOverview: string | undefined;
+      if (options.overview) {
+        try {
+          prOverview = readFileSync(options.overview, 'utf8');
+        } catch (error) {
+          console.warn(
+            `Warning: Failed to read --overview file "${options.overview}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+          );
+        }
+      }
 
       if (
         options.context !== undefined &&
@@ -271,6 +287,18 @@ program
         }
 
         try {
+          prContext = {
+            prUrl: options.pr,
+            headSha: getPrHeadSha(options.pr),
+            prTitle: getPrTitle(options.pr),
+          };
+        } catch (error) {
+          console.warn(
+            `Warning: Failed to resolve PR head SHA; "Post to GitHub" will be disabled: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          );
+        }
+
+        try {
           const prCommentImports = await getPrCommentImports(options.pr);
           commentImports = [...prCommentImports, ...manualCommentImports];
         } catch (error) {
@@ -314,6 +342,8 @@ program
           clearComments: options.clean,
           keepAlive: options.keepAlive,
           ...(commentImports.length > 0 ? { commentImports } : {}),
+          ...(prContext ? { prContext } : {}),
+          ...(prOverview ? { prOverview } : {}),
         });
 
         if (backgroundMode) {
@@ -374,6 +404,7 @@ program
         diffMode: determineDiffMode(selection, compareWith),
         repoPath,
         ...(commentImports.length > 0 ? { commentImports } : {}),
+        ...(prOverview ? { prOverview } : {}),
       });
 
       if (backgroundMode) {

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { type Server } from 'http';
 import { join, dirname, isAbsolute, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,7 @@ import { getFileExtension } from '../utils/fileUtils.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
+import { registerGitHubReviewRoute } from './githubReviewRoute.js';
 
 import {
   type BaseMode,
@@ -58,6 +59,10 @@ interface ServerOptions {
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
+  // Present only in --pr mode: enables POST /api/github-review (pending review).
+  prContext?: { prUrl: string; headSha: string; prTitle?: string };
+  // Optional markdown shown as a "PR Overview" banner in the client.
+  prOverview?: string;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -125,8 +130,24 @@ export async function startServer(
 ): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
   const app = express();
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
-  const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
+  // In --pr mode there is no reliable local commit-ish (the diff is fetched
+  // from GitHub via stdin, see the `stdinDiff` branch below), so comment/viewed
+  // storage can't be scoped by baseCommitish/targetCommitish the way git-mode
+  // diffs are. Scope by the PR identity + head SHA instead of the repo path,
+  // otherwise every PR ever reviewed from this checkout collapses onto the same
+  // storage bucket (repositoryId, unlike baseCommitish/targetCommitish, has no
+  // client-side meaning beyond storage isolation, so this is safe to repurpose).
+  const repositoryId = options.prContext
+    ? createHash('sha256')
+        .update(`pr:${options.prContext.prUrl}@${options.prContext.headSha}`)
+        .digest('hex')
+    : createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
+  // Pending-review write path (only active in --pr mode).
+  const reviewPostToken = options.prContext ? randomBytes(32).toString('hex') : undefined;
+  const isLoopbackBind =
+    !options.host || options.host === 'localhost' || options.host === '127.0.0.1';
+  let boundPort = options.preferredPort ?? 4966;
   const initialSelection = options.selection ?? createDiffSelection('', '');
   const commentImportId =
     initialCommentImports.length > 0
@@ -151,10 +172,17 @@ export async function startServer(
   app.use(express.json());
   app.use(express.text()); // For sendBeacon text/plain requests
 
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', 'http://localhost:*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    // A given port can be reused by a different diff/PR across server restarts
+    // (--pr mode always binds the same default port). Without this, a plain
+    // reload can serve a browser-cached /api/* response from a previous,
+    // unrelated session on this origin instead of hitting the new process.
+    if (req.path.startsWith('/api/')) {
+      res.header('Cache-Control', 'no-store');
+    }
     next();
   });
 
@@ -199,11 +227,12 @@ export async function startServer(
     Boolean(options.stdinDiff),
   );
 
-  function parseRepositoryRelativePath(
-    filepath: unknown,
-  ):
+  function parseRepositoryRelativePath(filepath: unknown):
     | { ok: true; path: string }
-    | { ok: false; error: 'Invalid file path' | 'File path outside repository' } {
+    | {
+        ok: false;
+        error: 'Invalid file path' | 'File path outside repository';
+      } {
     if (typeof filepath !== 'string' || filepath.length === 0) {
       return { ok: false, error: 'Invalid file path' };
     }
@@ -288,6 +317,18 @@ export async function startServer(
     return nextSession;
   }
 
+  if (options.prContext && reviewPostToken) {
+    registerGitHubReviewRoute(app, {
+      prContext: options.prContext,
+      reviewPostToken,
+      isLoopbackBind,
+      getPort: () => boundPort,
+      resolveSelection: (query) => getCommentSelectionFromQuery(query),
+      getThreads: (selection) => getOrCreateCommentSession(selection).threads,
+      getDiffFiles: () => initialDiffData.files,
+    });
+  }
+
   app.get('/api/diff', async (req, res) => {
     const ignoreWhitespace = req.query.ignoreWhitespace === 'true';
     const hasBase = typeof req.query.base === 'string';
@@ -355,6 +396,10 @@ export async function startServer(
       repositoryId,
       commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
       commentImportId: shouldIncludeCommentImports ? commentImportId : undefined,
+      prUrl: options.prContext?.prUrl,
+      prTitle: options.prContext?.prTitle,
+      reviewPostToken,
+      prOverview: options.prOverview,
     });
   });
 
@@ -993,6 +1038,7 @@ export async function startServer(
     options.preferredPort || 4966,
     options.host || 'localhost',
   );
+  boundPort = port;
 
   // Security warning for non-localhost binding
   if (options.host && options.host !== '127.0.0.1' && options.host !== 'localhost') {
